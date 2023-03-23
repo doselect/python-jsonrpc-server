@@ -36,7 +36,7 @@ class Endpoint(object):
     def shutdown(self):
         self._executor_service.shutdown()
 
-    def notify(self, method, params=None):
+    def notify(self, method, socket_id, params=None):
         """Send a JSON RPC notification to the client.
 
          Args:
@@ -47,6 +47,7 @@ class Endpoint(object):
 
         message = {
             'jsonrpc': JSONRPC_VERSION,
+            'socketId': socket_id,
             'method': method,
         }
         if params is not None:
@@ -54,7 +55,7 @@ class Endpoint(object):
 
         self._consumer(message)
 
-    def request(self, method, params=None):
+    def request(self, socket_id, method, params=None):
         """Send a JSON RPC request to the client.
 
         Args:
@@ -69,6 +70,7 @@ class Endpoint(object):
 
         message = {
             'jsonrpc': JSONRPC_VERSION,
+            'socketId': socket_id,
             'id': msg_id,
             'method': method,
         }
@@ -76,18 +78,18 @@ class Endpoint(object):
             message['params'] = params
 
         request_future = futures.Future()
-        request_future.add_done_callback(self._cancel_callback(msg_id))
+        request_future.add_done_callback(self._cancel_callback(socket_id, msg_id))
 
         self._server_request_futures[msg_id] = request_future
         self._consumer(message)
 
         return request_future
 
-    def _cancel_callback(self, request_id):
+    def _cancel_callback(self, socket_id, request_id):
         """Construct a cancellation callback for the given request ID."""
         def callback(future):
             if future.cancelled():
-                self.notify(CANCEL_METHOD, {'id': request_id})
+                self.notify(CANCEL_METHOD, socket_id, {'id': request_id})
                 future.set_exception(JsonRpcRequestCancelled())
         return callback
 
@@ -98,23 +100,24 @@ class Endpoint(object):
             message (dict): The JSON RPC message sent by the client
         """
         if 'jsonrpc' not in message or message['jsonrpc'] != JSONRPC_VERSION:
-            log.warning("Unknown message type %s", message)
+            log.exception("Unknown message type %s", message)
             return
 
         if 'id' not in message:
-            log.debug("Handling notification from client %s", message)
-            self._handle_notification(message['method'], message.get('params'))
+            log.exception("Handling notification from client %s", message)
+            self._handle_notification(message['method'], message['socketId'], message.get('params'))
         elif 'method' not in message:
-            log.debug("Handling response from client %s", message)
-            self._handle_response(message['id'], message.get('result'), message.get('error'))
+            log.exception("Handling response from client %s", message)
+            self._handle_response(message['id'], message['socketId'], message.get('result'), message.get('error'))
         else:
             try:
-                log.debug("Handling request from client %s", message)
-                self._handle_request(message['id'], message['method'], message.get('params'))
+                log.exception("Handling request from client %s", message)
+                self._handle_request(message['id'], message['socketId'], message['method'], message.get('params'))
             except JsonRpcException as e:
                 log.exception("Failed to handle request %s", message['id'])
                 self._consumer({
                     'jsonrpc': JSONRPC_VERSION,
+                    'socketId': message['socketId'],
                     'id': message['id'],
                     'error': e.to_dict()
                 })
@@ -122,18 +125,22 @@ class Endpoint(object):
                 log.exception("Failed to handle request %s", message['id'])
                 self._consumer({
                     'jsonrpc': JSONRPC_VERSION,
+                    'socketId': message['socketId'],
                     'id': message['id'],
                     'error': JsonRpcInternalError.of(sys.exc_info()).to_dict()
                 })
 
-    def _handle_notification(self, method, params):
+    def _handle_notification(self, method, socket_id, params):
         """Handle a notification from the client."""
         if method == CANCEL_METHOD:
             self._handle_cancel_notification(params['id'])
             return
+        
+        params['socket_id'] = socket_id
 
         try:
             handler = self._dispatcher[method]
+            log.exception("handler name %s", handler)
         except KeyError:
             log.warning("Ignoring notification for unknown method %s", method)
             return
@@ -141,7 +148,7 @@ class Endpoint(object):
         try:
             handler_result = handler(params)
         except Exception:  # pylint: disable=broad-except
-            log.exception("Failed to handle notification %s: %s", method, params)
+            log.exception("Failed to handle notification %s: %s", method, type(params))
             return
 
         if callable(handler_result):
@@ -172,33 +179,36 @@ class Endpoint(object):
         if request_future.cancel():
             log.debug("Cancelled request with id %s", msg_id)
 
-    def _handle_request(self, msg_id, method, params):
+    def _handle_request(self, msg_id, socket_id, method, params):
         """Handle a request from the client."""
         try:
             handler = self._dispatcher[method]
         except KeyError:
             raise JsonRpcMethodNotFound.of(method)
 
+        params['socket_id'] = socket_id
+
         handler_result = handler(params)
 
         if callable(handler_result):
-            log.debug("Executing async request handler %s", handler_result)
+            log.exception("Executing async request handler %s", handler_result)
             request_future = self._executor_service.submit(handler_result)
             self._client_request_futures[msg_id] = request_future
-            request_future.add_done_callback(self._request_callback(msg_id))
+            request_future.add_done_callback(self._request_callback(socket_id,msg_id))
         elif isinstance(handler_result, futures.Future):
-            log.debug("Request handler is already a future %s", handler_result)
+            log.exception("Request handler is already a future %s", handler_result)
             self._client_request_futures[msg_id] = handler_result
-            handler_result.add_done_callback(self._request_callback(msg_id))
+            handler_result.add_done_callback(self._request_callback(socket_id, msg_id))
         else:
-            log.debug("Got result from synchronous request handler: %s", handler_result)
+            log.exception("Got result from synchronous request handler: %s", handler_result)
             self._consumer({
                 'jsonrpc': JSONRPC_VERSION,
                 'id': msg_id,
+                'socketId': socket_id,
                 'result': handler_result
             })
 
-    def _request_callback(self, request_id):
+    def _request_callback(self, socket_id, request_id):
         """Construct a request callback for the given request ID."""
         def callback(future):
             # Remove the future from the client requests map
@@ -209,6 +219,7 @@ class Endpoint(object):
 
             message = {
                 'jsonrpc': JSONRPC_VERSION,
+                'socketId': socket_id,
                 'id': request_id,
             }
 
@@ -225,7 +236,7 @@ class Endpoint(object):
 
         return callback
 
-    def _handle_response(self, msg_id, result=None, error=None):
+    def _handle_response(self, msg_id, socket_id, result=None, error=None):
         """Handle a response from the client."""
         request_future = self._server_request_futures.pop(msg_id, None)
 

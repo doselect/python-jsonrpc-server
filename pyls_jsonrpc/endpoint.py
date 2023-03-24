@@ -100,18 +100,18 @@ class Endpoint(object):
             message (dict): The JSON RPC message sent by the client
         """
         if 'jsonrpc' not in message or message['jsonrpc'] != JSONRPC_VERSION:
-            log.exception("Unknown message type %s", message)
+            log.debug("Unknown message type %s", message)
             return
 
         if 'id' not in message:
-            log.exception("Handling notification from client %s", message)
+            log.debug("Handling notification from client %s", message)
             self._handle_notification(message['method'], message['socketId'], message.get('params'))
         elif 'method' not in message:
-            log.exception("Handling response from client %s", message)
+            log.debug("Handling response from client %s", message)
             self._handle_response(message['id'], message['socketId'], message.get('result'), message.get('error'))
         else:
             try:
-                log.exception("Handling request from client %s", message)
+                log.debug("Handling request from client %s", message)
                 self._handle_request(message['id'], message['socketId'], message['method'], message.get('params'))
             except JsonRpcException as e:
                 log.exception("Failed to handle request %s", message['id'])
@@ -140,7 +140,6 @@ class Endpoint(object):
 
         try:
             handler = self._dispatcher[method]
-            log.exception("handler name %s", handler)
         except KeyError:
             log.warning("Ignoring notification for unknown method %s", method)
             return
@@ -148,7 +147,7 @@ class Endpoint(object):
         try:
             handler_result = handler(params)
         except Exception:  # pylint: disable=broad-except
-            log.exception("Failed to handle notification %s: %s", method, type(params))
+            log.exception("Failed to handle notification %s: %s", method, params)
             return
 
         if callable(handler_result):
@@ -191,16 +190,16 @@ class Endpoint(object):
         handler_result = handler(params)
 
         if callable(handler_result):
-            log.exception("Executing async request handler %s", handler_result)
+            log.debug("Executing async request handler %s", handler_result)
             request_future = self._executor_service.submit(handler_result)
             self._client_request_futures[msg_id] = request_future
             request_future.add_done_callback(self._request_callback(socket_id,msg_id))
         elif isinstance(handler_result, futures.Future):
-            log.exception("Request handler is already a future %s", handler_result)
+            log.debug("Request handler is already a future %s", handler_result)
             self._client_request_futures[msg_id] = handler_result
             handler_result.add_done_callback(self._request_callback(socket_id, msg_id))
         else:
-            log.exception("Got result from synchronous request handler: %s", handler_result)
+            log.debug("Got result from synchronous request handler: %s", handler_result)
             self._consumer({
                 'jsonrpc': JSONRPC_VERSION,
                 'id': msg_id,
